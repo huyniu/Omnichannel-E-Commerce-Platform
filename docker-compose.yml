@@ -1,0 +1,239 @@
+# Local / demo environment: builds every service from source.
+#   docker compose up -d --build
+# Infrastructure ports are bound to 127.0.0.1 only (handy for DB tools, never public).
+# Add monitoring with: docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
+
+name: omni
+
+x-java-service: &java-service
+  restart: unless-stopped
+  networks: [backend-network]
+  deploy:
+    resources:
+      limits:
+        memory: 512M
+  environment: &common-env
+    JAVA_OPTS: "-XX:MaxRAMPercentage=75 -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError"
+    OTLP_ENDPOINT: http://jaeger:4318/v1/traces
+    TRACING_SAMPLING: ${TRACING_SAMPLING:-0.0}
+
+services:
+  # ------------------------------------------------------------------ infrastructure
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      IDENTITY_DB_PASSWORD: ${IDENTITY_DB_PASSWORD:-identity}
+      ORDER_DB_PASSWORD: ${ORDER_DB_PASSWORD:-order_svc}
+      PAYMENT_DB_PASSWORD: ${PAYMENT_DB_PASSWORD:-payment_svc}
+    command: ["postgres", "-c", "max_connections=300"]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./deploy/postgres/init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh:ro
+    # Host port 5433 so it never clashes with a PostgreSQL already installed on the developer machine.
+    ports: ["127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      retries: 20
+    networks: [backend-network]
+
+  mongo:
+    image: mongo:7.0
+    restart: unless-stopped
+    volumes: [mongo-data:/data/db]
+    ports: ["127.0.0.1:27017:27017"]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      retries: 20
+    networks: [backend-network]
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
+    volumes: [redis-data:/data]
+    ports: ["127.0.0.1:6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 20
+    networks: [backend-network]
+
+  kafka:
+    image: apache/kafka:3.8.0
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_HEAP_OPTS: "-Xms512m -Xmx512m"
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"  # any base64 UUID, fixed so restarts reuse the same log dir
+    volumes: [kafka-data:/var/lib/kafka/data]
+    ports: ["127.0.0.1:29092:29092"]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+    networks: [backend-network]
+
+  # One-shot job: creates topics (and their dead-letter topics) before any service starts.
+  kafka-init:
+    image: apache/kafka:3.8.0
+    depends_on:
+      kafka: { condition: service_healthy }
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        for t in order.events payment.events order.events.DLT payment.events.DLT; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists \
+            --topic $$t --partitions 3 --replication-factor 1
+        done
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list
+    restart: "no"
+    networks: [backend-network]
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    volumes: [es-data:/usr/share/elasticsearch/data]
+    ports: ["127.0.0.1:9200:9200"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      retries: 30
+    networks: [backend-network]
+
+  # Fake SMTP server with a web inbox at http://localhost:8025
+  mailpit:
+    image: axllent/mailpit:v1.20
+    restart: unless-stopped
+    ports: ["127.0.0.1:8025:8025", "127.0.0.1:1025:1025"]
+    networks: [backend-network]
+
+  # ------------------------------------------------------------------ microservices
+  api-gateway:
+    <<: *java-service
+    build: { context: ., dockerfile: api-gateway/Dockerfile }
+    image: omni-api-gateway:local
+    environment:
+      <<: *common-env
+      REDIS_HOST: redis
+      JWT_SECRET: ${JWT_SECRET:-change-me-to-a-long-random-secret-at-least-32-bytes}
+      IDENTITY_URI: http://identity-service:8081
+      PRODUCT_URI: http://product-service:8082
+      ORDER_URI: http://order-service:8083
+      PAYMENT_URI: http://payment-service:8084
+      NOTIFICATION_URI: http://notification-service:8085
+      RATE_LIMIT_REPLENISH: ${RATE_LIMIT_REPLENISH:-50}
+      RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-100}
+    ports: ["8080:8080"]
+    depends_on:
+      redis: { condition: service_healthy }
+
+  identity-service:
+    <<: *java-service
+    build: { context: ., dockerfile: identity-service/Dockerfile }
+    image: omni-identity-service:local
+    environment:
+      <<: *common-env
+      DB_HOST: postgres
+      DB_PASSWORD: ${IDENTITY_DB_PASSWORD:-identity}
+      JWT_SECRET: ${JWT_SECRET:-change-me-to-a-long-random-secret-at-least-32-bytes}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@omni.local}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-Admin@123}
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  product-service:
+    <<: *java-service
+    build: { context: ., dockerfile: product-service/Dockerfile }
+    image: omni-product-service:local
+    environment:
+      <<: *common-env
+      MONGO_URI: mongodb://mongo:27017/product_db
+      ELASTICSEARCH_URIS: http://elasticsearch:9200
+      SEED_SAMPLE_DATA: "true"
+    depends_on:
+      mongo: { condition: service_healthy }
+      elasticsearch: { condition: service_healthy }
+
+  order-service:
+    <<: *java-service
+    build: { context: ., dockerfile: order-service/Dockerfile }
+    image: omni-order-service:local
+    environment:
+      <<: *common-env
+      DB_HOST: postgres
+      DB_PASSWORD: ${ORDER_DB_PASSWORD:-order_svc}
+      REDIS_HOST: redis
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      PRODUCT_GRPC_ADDRESS: static://product-service:9090
+      ORDER_PAYMENT_TIMEOUT: ${ORDER_PAYMENT_TIMEOUT:-15m}
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
+
+  payment-service:
+    <<: *java-service
+    build: { context: ., dockerfile: payment-service/Dockerfile }
+    image: omni-payment-service:local
+    environment:
+      <<: *common-env
+      DB_HOST: postgres
+      DB_PASSWORD: ${PAYMENT_DB_PASSWORD:-payment_svc}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8080}
+      MOCK_GATEWAY_ENABLED: ${MOCK_GATEWAY_ENABLED:-true}
+      MOCK_GATEWAY_SECRET: ${MOCK_GATEWAY_SECRET:-mock-gateway-secret}
+      VNPAY_TMN_CODE: ${VNPAY_TMN_CODE:-}
+      VNPAY_HASH_SECRET: ${VNPAY_HASH_SECRET:-}
+      VNPAY_RETURN_URL: ${VNPAY_RETURN_URL:-http://localhost:8080/api/payments/vnpay/return}
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
+
+  notification-service:
+    <<: *java-service
+    build: { context: ., dockerfile: notification-service/Dockerfile }
+    image: omni-notification-service:local
+    environment:
+      <<: *common-env
+      MONGO_URI: mongodb://mongo:27017/notification_db
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SMTP_HOST: mailpit
+      SMTP_PORT: 1025
+    depends_on:
+      mongo: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
+
+networks:
+  backend-network:
+    name: backend-network
+
+volumes:
+  postgres-data:
+  mongo-data:
+  redis-data:
+  kafka-data:
+  es-data:

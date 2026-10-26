@@ -1,0 +1,128 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: api-gateway
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+  cloud:
+    gateway:
+      globalcors:
+        cors-configurations:
+          '[/**]':
+            allowed-origin-patterns: ${CORS_ALLOWED_ORIGINS:*}
+            allowed-methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+            allowed-headers: "*"
+            max-age: 3600
+      default-filters:
+        - DedupeResponseHeader=Access-Control-Allow-Origin Access-Control-Allow-Credentials, RETAIN_UNIQUE
+        - name: RequestRateLimiter
+          args:
+            key-resolver: "#{@userOrIpKeyResolver}"
+            redis-rate-limiter.replenishRate: ${RATE_LIMIT_REPLENISH:50}
+            redis-rate-limiter.burstCapacity: ${RATE_LIMIT_BURST:100}
+            redis-rate-limiter.requestedTokens: 1
+      routes:
+        - id: identity-service
+          uri: ${IDENTITY_URI:http://localhost:8081}
+          predicates:
+            - Path=/api/auth/**,/api/users/**
+        - id: product-service
+          uri: ${PRODUCT_URI:http://localhost:8082}
+          predicates:
+            - Path=/api/products/**,/api/categories/**
+        - id: order-service
+          uri: ${ORDER_URI:http://localhost:8083}
+          predicates:
+            - Path=/api/orders/**,/api/inventory/**
+        - id: payment-service
+          uri: ${PAYMENT_URI:http://localhost:8084}
+          predicates:
+            - Path=/api/payments/**
+        - id: notification-service
+          uri: ${NOTIFICATION_URI:http://localhost:8085}
+          predicates:
+            - Path=/api/notifications/**
+        # OpenAPI documents of each service, aggregated in the gateway Swagger UI
+        - id: docs-identity
+          uri: ${IDENTITY_URI:http://localhost:8081}
+          predicates:
+            - Path=/docs/identity/**
+          filters:
+            - RewritePath=/docs/identity/(?<seg>.*), /$\{seg}
+        - id: docs-product
+          uri: ${PRODUCT_URI:http://localhost:8082}
+          predicates:
+            - Path=/docs/product/**
+          filters:
+            - RewritePath=/docs/product/(?<seg>.*), /$\{seg}
+        - id: docs-order
+          uri: ${ORDER_URI:http://localhost:8083}
+          predicates:
+            - Path=/docs/order/**
+          filters:
+            - RewritePath=/docs/order/(?<seg>.*), /$\{seg}
+        - id: docs-payment
+          uri: ${PAYMENT_URI:http://localhost:8084}
+          predicates:
+            - Path=/docs/payment/**
+          filters:
+            - RewritePath=/docs/payment/(?<seg>.*), /$\{seg}
+        - id: docs-notification
+          uri: ${NOTIFICATION_URI:http://localhost:8085}
+          predicates:
+            - Path=/docs/notification/**
+          filters:
+            - RewritePath=/docs/notification/(?<seg>.*), /$\{seg}
+
+gateway:
+  security:
+    jwt-secret: ${JWT_SECRET:change-me-to-a-long-random-secret-at-least-32-bytes}
+    public-paths:
+      - POST:/api/auth/**
+      - GET:/api/products/**
+      - GET:/api/categories/**
+      - GET:/api/inventory/**
+      - POST:/api/payments/webhook/**
+      - GET:/api/payments/vnpay/**
+      - /docs/**
+      - /swagger-ui.html
+      - /swagger-ui/**
+      - /v3/api-docs/**
+      - /webjars/**
+      - /actuator/health/**
+
+springdoc:
+  swagger-ui:
+    urls:
+      - { name: identity, url: /docs/identity/v3/api-docs }
+      - { name: product, url: /docs/product/v3/api-docs }
+      - { name: order, url: /docs/order/v3/api-docs }
+      - { name: payment, url: /docs/payment/v3/api-docs }
+      - { name: notification, url: /docs/notification/v3/api-docs }
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,gateway
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  tracing:
+    sampling:
+      probability: ${TRACING_SAMPLING:1.0}
+  otlp:
+    tracing:
+      endpoint: ${OTLP_ENDPOINT:http://localhost:4318/v1/traces}
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+logging:
+  pattern:
+    level: "%5p [${spring.application.name:},%X{traceId:-},%X{spanId:-}]"

@@ -1,0 +1,10 @@
+**/target
+**/.idea
+**/*.iml
+.git
+.github
+docs
+load-test
+deploy
+*.md
+.env

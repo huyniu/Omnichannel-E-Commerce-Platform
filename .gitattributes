@@ -1,0 +1,4 @@
+# Keep LF everywhere: shell scripts and configs are executed inside Linux containers.
+* text=auto eol=lf
+*.jar binary
+*.png binary

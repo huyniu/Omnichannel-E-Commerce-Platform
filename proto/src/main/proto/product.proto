@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package omni.product.v1;
+
+option java_multiple_files = true;
+option java_package = "com.omni.proto.product";
+option java_outer_classname = "ProductProto";
+
+// Internal, low-latency lookup used by the Order Service while placing an order.
+// Only the order-relevant snapshot of a SKU is exposed (bounded context: Order sees
+// a product as sku + name + price at purchase time, not the full catalog document).
+service ProductCatalog {
+  rpc GetSkus (GetSkusRequest) returns (GetSkusResponse);
+}
+
+message GetSkusRequest {
+  repeated string skus = 1;
+}
+
+message SkuInfo {
+  string sku = 1;
+  string product_id = 2;
+  string product_name = 3;
+  string variant_name = 4;
+  int64 price = 5;          // VND, no decimals
+  bool active = 6;
+  string image_url = 7;
+}
+
+message GetSkusResponse {
+  repeated SkuInfo items = 1;   // unknown SKUs are simply absent
+}

@@ -1,0 +1,79 @@
+# Observability stack, layered on top of either compose file:
+#   docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
+#   docker compose -f docker-compose.production.yml -f docker-compose.monitoring.yml --env-file .env up -d
+#
+#   Grafana    http://localhost:3000   (dashboards: metrics from Prometheus, logs from Loki, traces from Jaeger)
+#   Prometheus http://localhost:9090
+#   Jaeger UI  http://localhost:16686
+# All UIs bind to 127.0.0.1; on the VPS reach them with an SSH tunnel:  ssh -L 3000:localhost:3000 user@vps
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+    volumes:
+      - ./deploy/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports: ["127.0.0.1:9090:9090"]
+    networks: [backend-network]
+
+  loki:
+    image: grafana/loki:3.1.1
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    volumes: [loki-data:/loki]
+    networks: [backend-network]
+
+  # Ships the stdout of every container to Loki, labelled by compose service name.
+  promtail:
+    image: grafana/promtail:3.1.1
+    restart: unless-stopped
+    command: ["-config.file=/etc/promtail/config.yml"]
+    volumes:
+      - ./deploy/monitoring/promtail.yml:/etc/promtail/config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [backend-network]
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    restart: unless-stopped
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports: ["127.0.0.1:16686:16686"]
+    networks: [backend-network]
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./deploy/monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports: ["127.0.0.1:3000:3000"]
+    depends_on: [prometheus, loki, jaeger]
+    networks: [backend-network]
+
+  # Turn on 100% trace sampling for the services when the tracing backend is present.
+  api-gateway:
+    environment: { TRACING_SAMPLING: "1.0" }
+  identity-service:
+    environment: { TRACING_SAMPLING: "1.0" }
+  product-service:
+    environment: { TRACING_SAMPLING: "1.0" }
+  order-service:
+    environment: { TRACING_SAMPLING: "1.0" }
+  payment-service:
+    environment: { TRACING_SAMPLING: "1.0" }
+  notification-service:
+    environment: { TRACING_SAMPLING: "1.0" }
+
+volumes:
+  prometheus-data:
+  loki-data:
+  grafana-data:
